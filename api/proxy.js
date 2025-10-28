@@ -4,12 +4,11 @@ import { put, list, del } from "@vercel/blob";
 
 const SECRET_KEY =
   "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
-
 const BLOB_BASE =
   "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
 const TTL = 300; // 5 minutes
 
-// simple ephemeral memory cache (resets with function lifetime)
+// ephemeral memory cache & in-flight locks
 const memCache = new Map();
 const inflight = new Map();
 
@@ -27,8 +26,8 @@ function decrypt(base64Input, key) {
   return out;
 }
 
-// Opportunistically clean up a few stale blobs
-async function cleanupSomeStaleBlobs(limit = 3) {
+// Purge stale blobs when explicitly requested
+async function cleanupStale(limit = 10) {
   try {
     const { blobs } = await list();
     const now = Date.now();
@@ -39,13 +38,15 @@ async function cleanupSomeStaleBlobs(limit = 3) {
       await del(b.url);
       console.log("🧹 deleted stale blob:", b.pathname);
     }
-  } catch (e) {
-    console.warn("cleanup failed:", e.message);
+    return { deleted: stale.length, total: blobs.length };
+  } catch (err) {
+    console.error("cleanup error:", err);
+    return { error: err.message };
   }
 }
 
 export default async function handler(req, res) {
-  // Handle CORS
+  // CORS
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
@@ -54,7 +55,17 @@ export default async function handler(req, res) {
   }
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Decrypt
+  // cleanup endpoint trigger
+  const urlPath = req.url.split("?")[0];
+  if (urlPath === "/cleanup") {
+    const result = await cleanupStale(10);
+    return res.status(200).json({
+      ok: true,
+      ...result,
+    });
+  }
+
+  // regular proxy handling
   const enc = req.url.startsWith("/") ? req.url.slice(1) : req.url;
   if (!enc) return res.status(400).send("Powered by V.CDN");
 
@@ -80,7 +91,7 @@ export default async function handler(req, res) {
     return res.status(200).send(mem.buf);
   }
 
-  // --- Ensure single origin fetch per dest (global lock) ---
+  // --- Global lock to prevent duplicate origin fetch ---
   if (inflight.has(dest)) {
     const data = await inflight.get(dest);
     res.setHeader("Content-Type", data.type);
@@ -109,9 +120,9 @@ export default async function handler(req, res) {
         }
       }
 
-      // Fetch origin (only one will run at a time)
+      // Otherwise fetch from origin
       const origin = await fetch(dest, {
-        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/3.0)" },
+        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/4.0)" },
       });
       if (!origin.ok)
         throw new Error(`Origin fetch failed: ${origin.status}`);
@@ -129,10 +140,6 @@ export default async function handler(req, res) {
       });
 
       memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
-
-      // Opportunistic cleanup (fire-and-forget)
-      cleanupSomeStaleBlobs().catch(() => {});
-
       return { buf, type };
     } finally {
       inflight.delete(dest);
