@@ -4,6 +4,6 @@
   "type": "module",
   "dependencies": {
     "@vercel/blob": "^0.22.0",
-    "redis": "^4.8.0"
+    "redis": "4.6.13"
   }
 }
