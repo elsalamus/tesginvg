@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "@vercel/blob": "^0.22.0"
+    "@vercel/blob": "^0.22.0",
+    "redis": "^4.8.0"
   }
 }
