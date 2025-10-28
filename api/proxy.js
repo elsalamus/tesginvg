@@ -1,17 +1,15 @@
 // api/proxy.js
 import crypto from "crypto";
-import { put, list, del } from "@vercel/blob";
+import { put, head, del, list } from "@vercel/blob";
 
-const SECRET_KEY =
-  "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
-const BLOB_BASE =
-  "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
-const TTL = 300; // 5 minutes
+const SECRET_KEY = "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
+const BLOB_BASE = "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
+const TTL = 300; // 5 min
 
-// ephemeral memory cache & in-flight locks
+// local memory cache for warm instances
 const memCache = new Map();
-const inflight = new Map();
 
+// XOR decrypt
 function decrypt(b64, key) {
   let s = b64.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
@@ -25,7 +23,6 @@ function decrypt(b64, key) {
   return out;
 }
 
-// cleanup endpoint
 async function cleanup(limit = 10) {
   try {
     const { blobs } = await list();
@@ -40,6 +37,17 @@ async function cleanup(limit = 10) {
   }
 }
 
+// waits up to `timeout` ms for blob to exist
+async function waitForBlob(blobUrl, timeout = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const r = await fetch(blobUrl, { method: "HEAD" });
+    if (r.ok) return true;
+    await new Promise(r => setTimeout(r, 400));
+  }
+  return false;
+}
+
 export default async function handler(req, res) {
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -49,7 +57,7 @@ export default async function handler(req, res) {
   }
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Manual cleanup endpoint
+  // Manual cleanup trigger
   if (req.url.split("?")[0] === "/cleanup") {
     const result = await cleanup();
     return res.status(200).json(result);
@@ -68,8 +76,9 @@ export default async function handler(req, res) {
 
   const key = crypto.createHash("sha1").update(dest).digest("hex");
   const blobUrl = `${BLOB_BASE}/${key}`;
+  const lockKey = `${key}.lock`;
 
-  // ---- Memory cache quick path ----
+  // 1️⃣ Memory quick path
   const mem = memCache.get(dest);
   if (mem && mem.expires > Date.now()) {
     res.setHeader("X-Cache-Source", "MEMORY");
@@ -81,39 +90,61 @@ export default async function handler(req, res) {
     return res.status(200).send(mem.buf);
   }
 
-  // ---- In-flight deduplication ----
-  if (inflight.has(dest)) {
-    const data = await inflight.get(dest);
-    res.setHeader("X-Cache-Source", "WAIT");
-    res.setHeader("Content-Type", data.type);
-    res.setHeader(
-      "Cache-Control",
-      `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
-    );
-    return res.status(200).send(data.buf);
-  }
-
-  const promise = (async () => {
-    try {
-      // Try Blob
-      const blobResp = await fetch(blobUrl);
-      if (blobResp.ok) {
-        const lastMod = new Date(blobResp.headers.get("last-modified"));
-        const age = Math.round((Date.now() - lastMod.getTime()) / 1000);
-        if (age < TTL) {
-          const buf = Buffer.from(await blobResp.arrayBuffer());
-          const type =
-            blobResp.headers.get("content-type") || "application/octet-stream";
-          memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
-          res.setHeader("X-Cache-Source", "BLOB");
-          res.setHeader("X-Blob-Age", age.toString());
-          return { buf, type };
-        }
+  try {
+    // 2️⃣ Try to read Blob
+    const blobResp = await fetch(blobUrl);
+    if (blobResp.ok) {
+      const lastMod = new Date(blobResp.headers.get("last-modified"));
+      const age = (Date.now() - lastMod.getTime()) / 1000;
+      if (age < TTL) {
+        const buf = Buffer.from(await blobResp.arrayBuffer());
+        const type =
+          blobResp.headers.get("content-type") || "application/octet-stream";
+        memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
+        res.setHeader("X-Cache-Source", "BLOB");
+        res.setHeader("X-Blob-Age", Math.round(age).toString());
+        res.setHeader("Content-Type", type);
+        res.setHeader(
+          "Cache-Control",
+          `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
+        );
+        return res.status(200).send(buf);
       }
+    }
 
-      // Fetch origin
+    // 3️⃣ Acquire distributed lock
+    const headLock = await fetch(`${BLOB_BASE}/${lockKey}`, { method: "HEAD" });
+    if (headLock.ok) {
+      // another instance is already fetching/uploading — wait
+      const ok = await waitForBlob(blobUrl, 15000);
+      if (ok) {
+        const resp = await fetch(blobUrl);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const type =
+          resp.headers.get("content-type") || "application/octet-stream";
+        memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
+        res.setHeader("X-Cache-Source", "WAIT-BLOB");
+        res.setHeader("Content-Type", type);
+        res.setHeader(
+          "Cache-Control",
+          `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
+        );
+        return res.status(200).send(buf);
+      }
+      res.setHeader("X-Cache-Source", "WAIT-TIMEOUT");
+    } else {
+      // create lock marker (~tiny blob)
+      await put(lockKey, Buffer.from("lock"), {
+        access: "public",
+        contentType: "text/plain",
+        cacheControlMaxAge: 15, // expires soon
+        addRandomSuffix: false,
+        allowOverwrite: false
+      });
+      res.setHeader("X-Cache-Lock", "ACQUIRED");
+      // 4️⃣ Fetch from origin
       const origin = await fetch(dest, {
-        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/Stable)" },
+        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/Locking)" },
       });
       if (!origin.ok)
         throw new Error(`Origin fetch failed: ${origin.status}`);
@@ -121,7 +152,7 @@ export default async function handler(req, res) {
       const type =
         origin.headers.get("content-type") || "application/octet-stream";
 
-      // Upload to Blob
+      // upload to Blob
       await put(key, buf, {
         access: "public",
         contentType: type,
@@ -130,28 +161,21 @@ export default async function handler(req, res) {
         allowOverwrite: true,
       });
 
+      // cleanup lock blob
+      try { await del(`${BLOB_BASE}/${lockKey}`); } catch (_) {}
+
       memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
       res.setHeader("X-Cache-Source", "ORIGIN");
       res.setHeader("X-Blob-Uploaded", "true");
-      return { buf, type };
-    } finally {
-      inflight.delete(dest);
+      res.setHeader("Content-Type", type);
+      res.setHeader(
+        "Cache-Control",
+        `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
+      );
+      return res.status(200).send(buf);
     }
-  })();
-
-  inflight.set(dest, promise);
-
-  try {
-    const data = await promise;
-    if (!res.getHeader("X-Cache-Source")) res.setHeader("X-Cache-Source", "UNKNOWN");
-    res.setHeader("Content-Type", data.type);
-    res.setHeader(
-      "Cache-Control",
-      `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
-    );
-    return res.status(200).send(data.buf);
-  } catch (err) {
-    console.error("[Proxy error]", err);
-    res.status(502).send("Error processing request.");
+  } catch (e) {
+    console.error("[Proxy error]", e);
+    return res.status(502).send("Error processing request.");
   }
 }
