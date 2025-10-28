@@ -2,51 +2,45 @@
 import crypto from "crypto";
 import { put, list, del } from "@vercel/blob";
 
-const SECRET_KEY =
-  "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
-const BLOB_BASE =
-  "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
+const SECRET_KEY = "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
+const BLOB_BASE = "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
 const TTL = 300; // 5 minutes
 
-// ephemeral memory cache & in-flight locks
+// ephemeral memory & in-flight dedupe
 const memCache = new Map();
 const inflight = new Map();
 
 // XOR decrypt
-function decrypt(base64Input, key) {
-  let base64 = base64Input.replace(/-/g, "+").replace(/_/g, "/");
-  while (base64.length % 4) base64 += "=";
-  const encrypted = Buffer.from(base64, "base64").toString("binary");
+function decrypt(b64, key) {
+  let s = b64.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const enc = Buffer.from(s, "base64").toString("binary");
   let out = "";
-  for (let i = 0; i < encrypted.length; i++) {
-    out += String.fromCharCode(
-      encrypted.charCodeAt(i) ^ key.charCodeAt(i % key.length)
-    );
+  for (let i = 0; i < enc.length; i++) {
+    out += String.fromCharCode(enc.charCodeAt(i) ^ key.charCodeAt(i % key.length));
   }
   return out;
 }
 
-// Purge stale blobs when explicitly requested
-async function cleanupStale(limit = 10) {
+// explicit cleanup endpoint
+async function cleanup(limit = 10) {
   try {
     const { blobs } = await list();
     const now = Date.now();
     const stale = blobs
-      .filter((b) => now - new Date(b.uploadedAt).getTime() > TTL * 1000)
+      .filter(b => now - new Date(b.uploadedAt).getTime() > TTL * 1000)
       .slice(0, limit);
     for (const b of stale) {
       await del(b.url);
-      console.log("🧹 deleted stale blob:", b.pathname);
+      console.log("🧹 Deleted:", b.pathname);
     }
     return { deleted: stale.length, total: blobs.length };
-  } catch (err) {
-    console.error("cleanup error:", err);
-    return { error: err.message };
+  } catch (e) {
+    return { error: e.message };
   }
 }
 
 export default async function handler(req, res) {
-  // CORS
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
@@ -55,17 +49,13 @@ export default async function handler(req, res) {
   }
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // cleanup endpoint trigger
-  const urlPath = req.url.split("?")[0];
-  if (urlPath === "/cleanup") {
-    const result = await cleanupStale(10);
-    return res.status(200).json({
-      ok: true,
-      ...result,
-    });
+  // Cleanup route
+  if (req.url.startsWith("/cleanup")) {
+    const result = await cleanup();
+    return res.status(200).json(result);
   }
 
-  // regular proxy handling
+  // Proxy route
   const enc = req.url.startsWith("/") ? req.url.slice(1) : req.url;
   if (!enc) return res.status(400).send("Powered by V.CDN");
 
@@ -80,31 +70,25 @@ export default async function handler(req, res) {
   const key = crypto.createHash("sha1").update(dest).digest("hex");
   const blobUrl = `${BLOB_BASE}/${key}`;
 
-  // --- Memory cache quick path ---
+  // quick in-memory cache
   const mem = memCache.get(dest);
   if (mem && mem.expires > Date.now()) {
     res.setHeader("Content-Type", mem.type);
-    res.setHeader(
-      "Cache-Control",
-      `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
-    );
+    res.setHeader("Cache-Control", `public, max-age=${TTL}, s-maxage=${TTL}`);
     return res.status(200).send(mem.buf);
   }
 
-  // --- Global lock to prevent duplicate origin fetch ---
+  // lock to prevent duplicate origin hits
   if (inflight.has(dest)) {
     const data = await inflight.get(dest);
     res.setHeader("Content-Type", data.type);
-    res.setHeader(
-      "Cache-Control",
-      `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
-    );
+    res.setHeader("Cache-Control", `public, max-age=${TTL}, s-maxage=${TTL}`);
     return res.status(200).send(data.buf);
   }
 
   const promise = (async () => {
     try {
-      // Try from Blob first
+      // 1️⃣ Try from Blob first (direct GET)
       const blobResp = await fetch(blobUrl);
       if (blobResp.ok) {
         const age =
@@ -120,17 +104,16 @@ export default async function handler(req, res) {
         }
       }
 
-      // Otherwise fetch from origin
+      // 2️⃣ Fetch origin (only one request due to lock)
       const origin = await fetch(dest, {
-        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/4.0)" },
+        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/Stable)" },
       });
-      if (!origin.ok)
-        throw new Error(`Origin fetch failed: ${origin.status}`);
+      if (!origin.ok) throw new Error(`Origin fetch failed: ${origin.status}`);
       const buf = Buffer.from(await origin.arrayBuffer());
       const type =
         origin.headers.get("content-type") || "application/octet-stream";
 
-      // Upload to Blob
+      // 3️⃣ Upload to Blob (works again)
       await put(key, buf, {
         access: "public",
         contentType: type,
@@ -156,8 +139,8 @@ export default async function handler(req, res) {
       `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
     );
     return res.status(200).send(data.buf);
-  } catch (err) {
-    console.error("[Proxy error]", err);
-    res.status(502).send("Error processing request.");
+  } catch (e) {
+    console.error("[Proxy error]", e);
+    return res.status(502).send("Error processing request.");
   }
 }
