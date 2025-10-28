@@ -1,4 +1,3 @@
-// api/proxy.js
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
@@ -9,11 +8,10 @@ const SECRET_KEY = "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
 const BLOB_BASE = "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
 const REDIS_URL =
   "redis://default:m21C2O6O7pbghmkp0JcOOS2by1an0941@redis-14551.c83.us-east-1-2.ec2.redns.redis-cloud.com:14551";
-const TTL = 600; // 10 min global lifetime
+const TTL = 600;
 const TMP_DIR = "/tmp";
 const memCache = new Map();
 
-// --- Redis connection ---
 let redisPromise;
 function getRedis() {
   if (!redisPromise)
@@ -26,7 +24,6 @@ function getRedis() {
   return redisPromise;
 }
 
-// --- Decrypt helper ---
 function decrypt(b64, key) {
   let s = b64.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
@@ -40,7 +37,6 @@ function decrypt(b64, key) {
   return out;
 }
 
-// --- Cleanup everything older than 5 min ---
 async function cleanupAll() {
   const cutoff = Date.now() - 5 * 60 * 1000;
   let deleted = 0;
@@ -58,18 +54,15 @@ async function cleanupAll() {
   return { deleted };
 }
 
-// --- Main handler ---
 export default async function handler(req, res) {
-  // --- CORS ---
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
     return res.status(204).end();
   }
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // --- Cleanup route ---
   if (req.url.startsWith("/cleanup")) {
     const result = await cleanupAll();
     return res.status(200).json(result);
@@ -90,10 +83,10 @@ export default async function handler(req, res) {
   const blobUrl = `${BLOB_BASE}/${key}`;
   const tmpPath = path.join(TMP_DIR, key);
   const metaKey = `meta:${key}`;
-  const lockKey = `lock:${key}`;
+  const fetchingKey = `fetching:${key}`;
   const redis = await getRedis();
 
-  // --- 1️⃣ Memory cache ---
+  // 1️⃣ memory
   const mem = memCache.get(dest);
   if (mem && mem.expires > Date.now()) {
     res.setHeader("X-Cache-Source", "MEMORY");
@@ -105,7 +98,7 @@ export default async function handler(req, res) {
     return res.status(200).send(mem.buf);
   }
 
-  // --- 2️⃣ /tmp cache ---
+  // 2️⃣ /tmp
   try {
     const stat = await fs.stat(tmpPath);
     if (Date.now() - stat.mtimeMs < TTL * 1000) {
@@ -120,7 +113,7 @@ export default async function handler(req, res) {
     }
   } catch {}
 
-  // --- 3️⃣ Redis metadata / Blob fetch ---
+  // 3️⃣ Redis meta check
   const metaRaw = await redis.get(metaKey);
   if (metaRaw) {
     const meta = JSON.parse(metaRaw);
@@ -133,7 +126,7 @@ export default async function handler(req, res) {
         try {
           await fs.writeFile(tmpPath, buf);
         } catch (e) {
-          if (e.code === "ENOSPC") console.warn("TMP full, skipping write");
+          if (e.code === "ENOSPC") console.warn("TMP full");
         }
         memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
         res.setHeader("X-Cache-Source", "BLOB");
@@ -147,10 +140,10 @@ export default async function handler(req, res) {
     }
   }
 
-  // --- 4️⃣ Redis lock (3 s) ---
-  const locked = await redis.set(lockKey, "1", { NX: true, EX: 3 });
-  if (!locked) {
-    // Wait for meta to appear
+  // 4️⃣ if someone already fetching globally
+  const fetching = await redis.get(fetchingKey);
+  if (fetching) {
+    // Wait for up to 5 seconds for upload to finish
     let waited = 0;
     while (waited < 5000) {
       const meta = await redis.get(metaKey);
@@ -162,27 +155,26 @@ export default async function handler(req, res) {
             blobResp.headers.get("content-type") || "application/octet-stream";
           try {
             await fs.writeFile(tmpPath, buf);
-          } catch (e) {
-            if (e.code === "ENOSPC") console.warn("TMP full, skipping write");
-          }
+          } catch (e) {}
           memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
-          res.setHeader("X-Cache-Source", "WAIT-BLOB");
+          res.setHeader("X-Cache-Source", "WAIT-GLOBAL");
           res.setHeader("Content-Type", type);
           return res.status(200).send(buf);
         }
       }
-      await new Promise((r) => setTimeout(r, 250));
-      waited += 250;
+      await new Promise((r) => setTimeout(r, 300));
+      waited += 300;
     }
     res.setHeader("X-Cache-Source", "WAIT-TIMEOUT");
-    return res.status(504).send("Timeout waiting for cache");
+    return res.status(504).send("Timeout waiting for global fetch");
   }
 
-  // --- 5️⃣ Origin fetch (leader) ---
+  // 5️⃣ leader: mark global fetch
+  await redis.set(fetchingKey, "1", { EX: 10 });
   res.setHeader("X-Cache-Lock", "ACQUIRED");
   const origin = await fetch(dest, {
     headers: {
-      "User-Agent": "VercelBlobProxy/UltraFast",
+      "User-Agent": "VercelBlobProxy/GlobalCoord",
       Connection: "keep-alive",
       "Accept-Encoding": "identity",
     },
@@ -192,15 +184,13 @@ export default async function handler(req, res) {
   const type =
     origin.headers.get("content-type") || "application/octet-stream";
 
-  // --- Local store (ignore full disk) ---
+  // store local
   try {
     await fs.writeFile(tmpPath, buf);
-  } catch (e) {
-    if (e.code === "ENOSPC") console.warn("TMP full, skipping write");
-  }
+  } catch (e) {}
   memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
 
-  // --- Respond immediately ---
+  // respond immediately
   res.setHeader("X-Cache-Source", "ORIGIN");
   res.setHeader("Content-Type", type);
   res.setHeader(
@@ -210,9 +200,14 @@ export default async function handler(req, res) {
   res.write(buf);
   res.end();
 
-  // --- Async Blob upload + Redis meta ---
+  // async upload + meta
   (async () => {
     try {
+      await redis.set(
+        metaKey,
+        JSON.stringify({ uploadedAt: Date.now() }),
+        { EX: TTL * 2 }
+      ); // mark as uploading first
       await put(key, buf, {
         access: "public",
         contentType: type,
@@ -223,12 +218,12 @@ export default async function handler(req, res) {
       await redis.set(
         metaKey,
         JSON.stringify({ uploadedAt: Date.now() }),
-        { EX: TTL }
+        { EX: TTL * 2 }
       );
-    } catch (err) {
-      console.warn("Blob upload failed:", err.message);
+    } catch (e) {
+      console.warn("Blob upload failed:", e.message);
     } finally {
-      await redis.del(lockKey);
+      await redis.del(fetchingKey);
     }
   })();
 }
