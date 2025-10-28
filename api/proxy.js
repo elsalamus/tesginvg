@@ -1,20 +1,24 @@
-import crypto from 'crypto';
-import { put, del } from '@vercel/blob';
+// api/proxy.js
+import crypto from "crypto";
+import { put, list, del } from "@vercel/blob";
 
-const SECRET_KEY = 'z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@';
+const SECRET_KEY =
+  "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
 
-// your blob store base URL
-const BLOB_BASE = 'https://73vhpohjcehuphyg.public.blob.vercel-storage.com';
+const BLOB_BASE =
+  "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
+const TTL = 300; // 5 minutes
 
-// 5-minute TTL (in seconds)
-const TTL = 300;
+// simple ephemeral memory cache (resets with function lifetime)
+const memCache = new Map();
+const inflight = new Map();
 
 // XOR decrypt
 function decrypt(base64Input, key) {
-  let base64 = base64Input.replace(/-/g, '+').replace(/_/g, '/');
-  while (base64.length % 4) base64 += '=';
-  const encrypted = Buffer.from(base64, 'base64').toString('binary');
-  let out = '';
+  let base64 = base64Input.replace(/-/g, "+").replace(/_/g, "/");
+  while (base64.length % 4) base64 += "=";
+  const encrypted = Buffer.from(base64, "base64").toString("binary");
+  let out = "";
   for (let i = 0; i < encrypted.length; i++) {
     out += String.fromCharCode(
       encrypted.charCodeAt(i) ^ key.charCodeAt(i % key.length)
@@ -23,81 +27,130 @@ function decrypt(base64Input, key) {
   return out;
 }
 
+// Opportunistically clean up a few stale blobs
+async function cleanupSomeStaleBlobs(limit = 3) {
+  try {
+    const { blobs } = await list();
+    const now = Date.now();
+    const stale = blobs
+      .filter((b) => now - new Date(b.uploadedAt).getTime() > TTL * 1000)
+      .slice(0, limit);
+    for (const b of stale) {
+      await del(b.url);
+      console.log("🧹 deleted stale blob:", b.pathname);
+    }
+  } catch (e) {
+    console.warn("cleanup failed:", e.message);
+  }
+}
+
 export default async function handler(req, res) {
-  // --- CORS ---
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
+  // Handle CORS
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
     return res.status(204).end();
   }
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // --- Decrypt ---
-  const encryptedPath = req.url.startsWith('/') ? req.url.slice(1) : req.url;
-  if (!encryptedPath) return res.status(400).send('Powered by V.CDN');
+  // Decrypt
+  const enc = req.url.startsWith("/") ? req.url.slice(1) : req.url;
+  if (!enc) return res.status(400).send("Powered by V.CDN");
+
   let dest;
   try {
-    dest = decrypt(encryptedPath.split('?')[0], SECRET_KEY);
+    dest = decrypt(enc.split("?")[0], SECRET_KEY);
     new URL(dest);
   } catch {
-    return res.status(400).send('Invalid encrypted URL.');
+    return res.status(400).send("Invalid encrypted URL.");
   }
 
-  // --- Hash for blob key ---
-  const blobKey = crypto.createHash('sha1').update(dest).digest('hex');
-  const blobUrl = `${BLOB_BASE}/${blobKey}`;
+  const key = crypto.createHash("sha1").update(dest).digest("hex");
+  const blobUrl = `${BLOB_BASE}/${key}`;
 
-  try {
-    // 1️⃣ Try from Blob first
-    const head = await fetch(blobUrl, { method: 'HEAD' });
-
-    if (head.ok) {
-      const lastMod = new Date(head.headers.get('last-modified'));
-      const ageSec = (Date.now() - lastMod.getTime()) / 1000;
-      if (ageSec < TTL) {
-        // ✅ Blob still valid
-        const resp = await fetch(blobUrl);
-        const buf = Buffer.from(await resp.arrayBuffer());
-        const type = resp.headers.get('content-type');
-        if (type) res.setHeader('Content-Type', type);
-        res.setHeader(
-          'Cache-Control',
-          `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
-        );
-        return res.status(200).send(buf);
-      } else {
-        // 🗑️ Blob expired — delete
-        await del(blobUrl);
-      }
-    }
-
-    // 2️⃣ Fetch from origin
-    const origin = await fetch(dest, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VercelBlobProxy/1.0)' },
-    });
-    if (!origin.ok) return res.status(origin.status).send('Origin fetch failed.');
-    const buf = Buffer.from(await origin.arrayBuffer());
-    const type = origin.headers.get('content-type') || 'application/octet-stream';
-
-    // 3️⃣ Upload to Blob
-    await put(blobKey, buf, {
-      access: 'public',
-      contentType: type,
-      cacheControlMaxAge: TTL,
-      addRandomSuffix: false,
-      allowOverwrite: true,
-    });
-
-    // 4️⃣ Send response
-    res.setHeader('Content-Type', type);
+  // --- Memory cache quick path ---
+  const mem = memCache.get(dest);
+  if (mem && mem.expires > Date.now()) {
+    res.setHeader("Content-Type", mem.type);
     res.setHeader(
-      'Cache-Control',
+      "Cache-Control",
       `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
     );
-    return res.status(200).send(buf);
+    return res.status(200).send(mem.buf);
+  }
+
+  // --- Ensure single origin fetch per dest (global lock) ---
+  if (inflight.has(dest)) {
+    const data = await inflight.get(dest);
+    res.setHeader("Content-Type", data.type);
+    res.setHeader(
+      "Cache-Control",
+      `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
+    );
+    return res.status(200).send(data.buf);
+  }
+
+  const promise = (async () => {
+    try {
+      // Try from Blob first
+      const blobResp = await fetch(blobUrl);
+      if (blobResp.ok) {
+        const age =
+          (Date.now() -
+            new Date(blobResp.headers.get("last-modified")).getTime()) /
+          1000;
+        if (age < TTL) {
+          const buf = Buffer.from(await blobResp.arrayBuffer());
+          const type =
+            blobResp.headers.get("content-type") || "application/octet-stream";
+          memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
+          return { buf, type };
+        }
+      }
+
+      // Fetch origin (only one will run at a time)
+      const origin = await fetch(dest, {
+        headers: { "User-Agent": "Mozilla/5.0 (VercelBlobProxy/3.0)" },
+      });
+      if (!origin.ok)
+        throw new Error(`Origin fetch failed: ${origin.status}`);
+      const buf = Buffer.from(await origin.arrayBuffer());
+      const type =
+        origin.headers.get("content-type") || "application/octet-stream";
+
+      // Upload to Blob
+      await put(key, buf, {
+        access: "public",
+        contentType: type,
+        cacheControlMaxAge: TTL,
+        addRandomSuffix: false,
+        allowOverwrite: true,
+      });
+
+      memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
+
+      // Opportunistic cleanup (fire-and-forget)
+      cleanupSomeStaleBlobs().catch(() => {});
+
+      return { buf, type };
+    } finally {
+      inflight.delete(dest);
+    }
+  })();
+
+  inflight.set(dest, promise);
+
+  try {
+    const data = await promise;
+    res.setHeader("Content-Type", data.type);
+    res.setHeader(
+      "Cache-Control",
+      `public, max-age=${TTL}, s-maxage=${TTL}, stale-while-revalidate=60`
+    );
+    return res.status(200).send(data.buf);
   } catch (err) {
-    console.error('[Proxy Error]', err);
-    res.status(502).send('Error processing request.');
+    console.error("[Proxy error]", err);
+    res.status(502).send("Error processing request.");
   }
 }
