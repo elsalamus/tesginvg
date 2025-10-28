@@ -1,8 +1,5 @@
 {
   "version": 2,
-  "routes": [
-    { "src": "/(.*)", "dest": "/api/proxy.js" }
-  ],
   "functions": {
     "api/**/*.js": {
       "runtime": "vercel/node@20.x",
@@ -10,6 +7,9 @@
       "maxDuration": 10
     }
   },
+  "routes": [
+    { "src": "/(.*)", "dest": "/api/proxy.js" }
+  ],
   "crons": [
     {
       "path": "/api/proxy.js/cleanup",
