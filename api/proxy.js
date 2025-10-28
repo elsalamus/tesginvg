@@ -5,15 +5,15 @@ import path from "path";
 import { createClient } from "redis";
 import { put, list, del } from "@vercel/blob";
 
-// --- Config ---
 const SECRET_KEY = "z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@";
 const BLOB_BASE = "https://73vhpohjcehuphyg.public.blob.vercel-storage.com";
 const REDIS_URL =
   "redis://default:m21C2O6O7pbghmkp0JcOOS2by1an0941@redis-14551.c83.us-east-1-2.ec2.redns.redis-cloud.com:14551";
-const TTL = 600; // 10 min retention
+const TTL = 600; // 10 min global lifetime
 const TMP_DIR = "/tmp";
 const memCache = new Map();
 
+// --- Redis connection ---
 let redisPromise;
 function getRedis() {
   if (!redisPromise)
@@ -26,6 +26,7 @@ function getRedis() {
   return redisPromise;
 }
 
+// --- Decrypt helper ---
 function decrypt(b64, key) {
   let s = b64.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
@@ -39,34 +40,38 @@ function decrypt(b64, key) {
   return out;
 }
 
-async function cleanup(limit = 20) {
+// --- Cleanup everything older than 5 min ---
+async function cleanupAll() {
+  const cutoff = Date.now() - 5 * 60 * 1000;
+  let deleted = 0;
   try {
     const { blobs } = await list();
-    const now = Date.now();
-    const stale = blobs
-      .filter((b) => now - new Date(b.uploadedAt).getTime() > TTL * 1000)
-      .slice(0, limit);
-    for (const b of stale) await del(b.url);
-    return { deleted: stale.length, total: blobs.length };
+    for (const b of blobs) {
+      if (new Date(b.uploadedAt).getTime() < cutoff) {
+        await del(b.url);
+        deleted++;
+      }
+    }
   } catch (e) {
-    return { error: e.message };
+    return { error: e.message, deleted };
   }
+  return { deleted };
 }
 
 // --- Main handler ---
 export default async function handler(req, res) {
-  // CORS
+  // --- CORS ---
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
     return res.status(204).end();
   }
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Cleanup trigger
-  if (req.url.split("?")[0] === "/cleanup") {
-    const result = await cleanup();
+  // --- Cleanup route ---
+  if (req.url.startsWith("/cleanup")) {
+    const result = await cleanupAll();
     return res.status(200).json(result);
   }
 
@@ -88,7 +93,7 @@ export default async function handler(req, res) {
   const lockKey = `lock:${key}`;
   const redis = await getRedis();
 
-  // --- 1️⃣ Memory Cache ---
+  // --- 1️⃣ Memory cache ---
   const mem = memCache.get(dest);
   if (mem && mem.expires > Date.now()) {
     res.setHeader("X-Cache-Source", "MEMORY");
@@ -115,7 +120,7 @@ export default async function handler(req, res) {
     }
   } catch {}
 
-  // --- 3️⃣ Redis metadata check (fast existence check, no HEADs) ---
+  // --- 3️⃣ Redis metadata / Blob fetch ---
   const metaRaw = await redis.get(metaKey);
   if (metaRaw) {
     const meta = JSON.parse(metaRaw);
@@ -125,7 +130,11 @@ export default async function handler(req, res) {
         const buf = Buffer.from(await blobResp.arrayBuffer());
         const type =
           blobResp.headers.get("content-type") || "application/octet-stream";
-        await fs.writeFile(tmpPath, buf);
+        try {
+          await fs.writeFile(tmpPath, buf);
+        } catch (e) {
+          if (e.code === "ENOSPC") console.warn("TMP full, skipping write");
+        }
         memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
         res.setHeader("X-Cache-Source", "BLOB");
         res.setHeader("Content-Type", type);
@@ -138,10 +147,10 @@ export default async function handler(req, res) {
     }
   }
 
-  // --- 4️⃣ Distributed Redis Lock (3s) ---
+  // --- 4️⃣ Redis lock (3 s) ---
   const locked = await redis.set(lockKey, "1", { NX: true, EX: 3 });
   if (!locked) {
-    // Wait for metadata to appear, no blob polling
+    // Wait for meta to appear
     let waited = 0;
     while (waited < 5000) {
       const meta = await redis.get(metaKey);
@@ -151,14 +160,14 @@ export default async function handler(req, res) {
           const buf = Buffer.from(await blobResp.arrayBuffer());
           const type =
             blobResp.headers.get("content-type") || "application/octet-stream";
-          await fs.writeFile(tmpPath, buf);
+          try {
+            await fs.writeFile(tmpPath, buf);
+          } catch (e) {
+            if (e.code === "ENOSPC") console.warn("TMP full, skipping write");
+          }
           memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
           res.setHeader("X-Cache-Source", "WAIT-BLOB");
           res.setHeader("Content-Type", type);
-          res.setHeader(
-            "Cache-Control",
-            "public, max-age=600, s-maxage=600, stale-while-revalidate=120"
-          );
           return res.status(200).send(buf);
         }
       }
@@ -169,7 +178,7 @@ export default async function handler(req, res) {
     return res.status(504).send("Timeout waiting for cache");
   }
 
-  // --- 5️⃣ Origin fetch (leader only) ---
+  // --- 5️⃣ Origin fetch (leader) ---
   res.setHeader("X-Cache-Lock", "ACQUIRED");
   const origin = await fetch(dest, {
     headers: {
@@ -183,11 +192,15 @@ export default async function handler(req, res) {
   const type =
     origin.headers.get("content-type") || "application/octet-stream";
 
-  // --- Save locally ---
-  await fs.writeFile(tmpPath, buf);
+  // --- Local store (ignore full disk) ---
+  try {
+    await fs.writeFile(tmpPath, buf);
+  } catch (e) {
+    if (e.code === "ENOSPC") console.warn("TMP full, skipping write");
+  }
   memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
 
-  // --- Upload asynchronously (don’t block response) ---
+  // --- Respond immediately ---
   res.setHeader("X-Cache-Source", "ORIGIN");
   res.setHeader("Content-Type", type);
   res.setHeader(
@@ -197,7 +210,7 @@ export default async function handler(req, res) {
   res.write(buf);
   res.end();
 
-  // --- Async background upload ---
+  // --- Async Blob upload + Redis meta ---
   (async () => {
     try {
       await put(key, buf, {
