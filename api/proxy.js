@@ -3,31 +3,31 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { createClient } from "redis";
-import { put, list, del } from "@vercel/blob";
+import { put } from "@vercel/blob";
 
-/* ------------------------- CONFIG ------------------------- */
+/* ------------- CONFIG ------------- */
 const SECRET_KEY = process.env.SECRET_KEY || 'z9b8x7c6v5n4m3l2k1j9h8g7f6d5s4a3p0o9i8u7y6t5r4e2w1q_!@';
 const BLOB_BASE = process.env.BLOB_BASE || 'https://73vhpohjcehuphyg.public.blob.vercel-storage.com';
 const REDIS_URL = process.env.REDIS_URL || 'redis://default:m21C2O6O7pbghmkp0JcOOS2by1an0941@redis-14551.c83.us-east-1-2.ec2.redns.redis-cloud.com:14551';
 
-// TTLs & lock duration (tune as needed)
-const TTL = 600;            // 10 minutes for edge s-maxage
-const META_TTL = TTL * 2;   // meta kept longer to avoid races
-const LOCK_SEC = 10;        // leader lock (seconds) — set 3 only if uploads <3s reliably
+// TTLs and locking
+const TTL = 600;           // edge s-maxage seconds (10 min)
+const META_TTL = TTL * 2;  // meta TTL in redis
+const LOCK_SEC = 5;        // upload lock duration (seconds) - change if needed
 const TMP_DIR = '/tmp';
-/* --------------------------------------------------------- */
+/* ---------------------------------- */
 
-/* In-process caches/dedupe */
-const inflight = new Map(); // dest -> Promise<result>
-const memCache = new Map(); // dest -> { buf, type, expires }
+/* in-process maps to dedupe within same instance */
+const inflight = new Map();   // dest -> Promise<result>
+const memCache = new Map();   // dest -> { buf, type, expires }
 
-/* Redis connection (single connecting promise) */
+/* single Redis connecting promise */
 let redisPromise;
 function getRedis() {
   if (!redisPromise) {
     redisPromise = (async () => {
       const r = createClient({ url: REDIS_URL });
-      r.on('error', (e) => console.error('Redis client error:', e && e.message ? e.message : e));
+      r.on('error', (e) => console.error('Redis error:', e && e.message ? e.message : e));
       await r.connect();
       return r;
     })();
@@ -55,7 +55,7 @@ async function writeTmpSafe(tmpPath, buf) {
     return true;
   } catch (e) {
     if (e && e.code === 'ENOSPC') {
-      console.warn('tmp full, skipping write');
+      console.warn('tmp full; skipping /tmp write');
       return false;
     }
     console.warn('tmp write failed:', e && e.message ? e.message : e);
@@ -74,9 +74,9 @@ async function tryPutBlobWithRetries(key, buf, type, attempts = 3) {
         allowOverwrite: true,
       });
       return { success: true };
-    } catch (e) {
-      const msg = e && e.message ? e.message : String(e);
-      console.warn(`Blob put attempt ${i} failed:`, msg);
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      console.warn(`blob put attempt ${i} failed:`, msg);
       if (i < attempts) await sleep(Math.min(1000 * i, 3000));
       if (i === attempts) return { success: false, error: msg };
     }
@@ -84,7 +84,7 @@ async function tryPutBlobWithRetries(key, buf, type, attempts = 3) {
   return { success: false, error: 'unknown' };
 }
 
-/* wait for meta.status === 'ready' with backoff */
+/* Wait until meta.status === 'ready' (backoff) */
 async function waitForMetaReady(redis, metaKey, timeoutMs = 8000) {
   const start = Date.now();
   let wait = 120;
@@ -95,12 +95,11 @@ async function waitForMetaReady(redis, metaKey, timeoutMs = 8000) {
         try {
           const meta = JSON.parse(raw);
           if (meta.status === 'ready') return meta;
-          // if failed, return it so caller can decide
           if (meta.status === 'failed') return meta;
         } catch {}
       }
     } catch (e) {
-      console.warn('redis.get metaKey error:', e && e.message ? e.message : e);
+      console.warn('redis.get(metaKey) error:', e && e.message ? e.message : e);
     }
     await sleep(wait + Math.floor(Math.random() * 60));
     wait = Math.min(1000, Math.floor(wait * 1.5));
@@ -108,28 +107,7 @@ async function waitForMetaReady(redis, metaKey, timeoutMs = 8000) {
   return null;
 }
 
-/* cleanup all blobs older than 5 minutes (single call) */
-async function cleanupAllOlderThan(cutoffMs) {
-  try {
-    const { blobs } = await list();
-    let deleted = 0;
-    for (const b of blobs) {
-      if (new Date(b.uploadedAt).getTime() < cutoffMs) {
-        try {
-          await del(b.url);
-          deleted++;
-        } catch (e) {
-          console.warn('del blob failed for', b.url, e && e.message ? e.message : e);
-        }
-      }
-    }
-    return { deleted };
-  } catch (e) {
-    return { error: e.message || String(e) };
-  }
-}
-
-/* ------------------------- Handler ------------------------- */
+/* ------------------ MAIN HANDLER ------------------ */
 export default async function handler(req, res) {
   // CORS preflight
   if (req.method === 'OPTIONS') {
@@ -140,41 +118,35 @@ export default async function handler(req, res) {
   }
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  // Cleanup route (cron or manual)
-  const urlPath = req.url.split('?')[0];
-  if (urlPath === '/cleanup' || urlPath === '/api/proxy.js/cleanup') {
-    const cutoff = Date.now() - 5 * 60 * 1000; // 5 minutes
-    const result = await cleanupAllOlderThan(cutoff);
-    return res.status(200).json({ ok: true, ...result });
-  }
-
-  // decrypt path -> dest
+  // decrypt the target path
   const enc = req.url.startsWith('/') ? req.url.slice(1) : req.url;
   if (!enc) return res.status(400).send('Powered by V.CDN');
 
   let dest;
   try {
     dest = decrypt(enc.split('?')[0], SECRET_KEY);
-    new URL(dest); // validate
+    new URL(dest);
   } catch (e) {
     return res.status(400).send('Invalid encrypted URL.');
   }
 
-  // dedupe in-process
+  // dedupe inside same instance
   if (inflight.has(dest)) {
     try {
-      const previous = await inflight.get(dest);
-      // set diagnostic headers
-      if (previous.tOrigin) res.setHeader('X-Timing-Origin-ms', String(previous.tOrigin));
-      if (previous.metaUploadedAt) res.setHeader('X-Blob-Age', String(Math.round((Date.now() - previous.metaUploadedAt) / 1000)));
-      res.setHeader('X-Cache-Source', previous.source || 'INTERNAL');
-      if (previous.type) res.setHeader('Content-Type', previous.type);
+      const out = await inflight.get(dest);
+      if (out.tOrigin) res.setHeader('X-Timing-Origin-ms', String(out.tOrigin));
+      if (out.metaUploadedAt) res.setHeader('X-Blob-Age', String(Math.round((Date.now() - out.metaUploadedAt) / 1000)));
+      res.setHeader('X-Cache-Source', out.source || 'INTERNAL');
+      if (out.uploadTriggered) res.setHeader('X-Upload-Triggered', String(out.uploadTriggered));
+      if (out.uploadStatus) res.setHeader('X-Blob-Upload-Status', out.uploadStatus);
+      if (out.uploadError) res.setHeader('X-Blob-Upload-Error', String(out.uploadError).slice(0,200));
+      if (out.type) res.setHeader('Content-Type', out.type);
       res.setHeader('Cache-Control', `public, s-maxage=${TTL}, max-age=${TTL}`);
 
       if (req.method === 'HEAD') return res.status(200).end();
-      return res.status(200).send(previous.buf);
-    } catch (_) {
-      // fallthrough
+      return res.status(200).send(out.buf);
+    } catch (e) {
+      // fall through to new attempt
     }
   }
 
@@ -182,14 +154,15 @@ export default async function handler(req, res) {
     const key = crypto.createHash('sha1').update(dest).digest('hex');
     const blobUrl = `${BLOB_BASE}/${key}`;
     const tmpPath = path.join(TMP_DIR, key);
-    const metaKey = `meta:${key}`;
-    const lockKey = `lock:${key}`;
+    const metaKey = `meta:${key}`;   // JSON { status: 'seen'|'uploading'|'ready'|'failed', uploadedAt: number }
+    const hitsKey = `hits:${key}`;   // counter of hits
+    const lockKey = `lock:${key}`;   // upload lock
     const redis = await getRedis();
 
     // 1) memory quick path
     const mem = memCache.get(dest);
     if (mem && mem.expires > Date.now()) {
-      return { buf: mem.buf, type: mem.type, source: 'MEMORY' };
+      return { buf: mem.buf, type: mem.type, source: 'MEMORY', uploadTriggered: false };
     }
 
     // 2) tmp quick path
@@ -197,201 +170,203 @@ export default async function handler(req, res) {
       const st = await fs.stat(tmpPath);
       if (Date.now() - st.mtimeMs < TTL * 1000) {
         const b = await fs.readFile(tmpPath);
-        return { buf: b, type: 'application/octet-stream', source: 'TMP' };
+        return { buf: b, type: 'application/octet-stream', source: 'TMP', uploadTriggered: false };
       }
     } catch (e) { /* ignore */ }
 
-    // 3) meta check: if ready -> single blob GET (no HEAD polling)
+    // 3) if meta ready -> fetch blob once and return
     try {
       const metaRaw = await redis.get(metaKey);
       if (metaRaw) {
         try {
           const meta = JSON.parse(metaRaw);
           if (meta.status === 'ready' && Date.now() - meta.uploadedAt < TTL * 1000) {
+            // single GET from blob (rely on CDN/edge)
             const blobResp = await fetch(blobUrl, { cache: 'force-cache' });
             if (blobResp.ok) {
               const b = Buffer.from(await blobResp.arrayBuffer());
               const t = blobResp.headers.get('content-type') || 'application/octet-stream';
               await writeTmpSafe(tmpPath, b);
               memCache.set(dest, { buf: b, type: t, expires: Date.now() + TTL * 1000 });
-              return { buf: b, type: t, source: 'BLOB', metaUploadedAt: meta.uploadedAt };
+              return { buf: b, type: t, source: 'BLOB', metaUploadedAt: meta.uploadedAt, uploadTriggered: false };
             }
-            // fallthrough if blob GET fails
+            // if blob GET failed, we will proceed to attempt leader etc.
           }
-          // if meta.status === 'uploading' we'll handle below
-        } catch (e) { /* ignore */ }
+        } catch (e) { /* ignore broken meta */ }
       }
     } catch (e) {
       console.warn('redis.get(metaKey) error:', e && e.message ? e.message : e);
     }
 
-    // 4) If meta exists and is uploading
+    // 4) NOT uploaded yet: increment hits counter atomically
+    let hits = 0;
     try {
-      const metaRaw2 = await redis.get(metaKey);
-      if (metaRaw2) {
-        const meta2 = JSON.parse(metaRaw2);
-        if (meta2.status === 'uploading') {
-          // HEAD: wait short for ready and return headers only
-          if (req.method === 'HEAD') {
-            const ready = await waitForMetaReady(redis, metaKey, 8000);
-            if (ready && ready.status === 'ready') {
-              return { buf: null, type: null, source: 'BLOB-READY', metaUploadedAt: ready.uploadedAt };
-            }
-            return { buf: null, type: null, source: 'WARMING' };
-          }
-
-          // GET: wait for ready to avoid origin hits
-          const readyMeta = await waitForMetaReady(redis, metaKey, 8000);
-          if (readyMeta && readyMeta.status === 'ready') {
-            const blobResp = await fetch(blobUrl, { cache: 'force-cache' });
-            if (blobResp.ok) {
-              const b = Buffer.from(await blobResp.arrayBuffer());
-              const t = blobResp.headers.get('content-type') || 'application/octet-stream';
-              await writeTmpSafe(tmpPath, b);
-              memCache.set(dest, { buf: b, type: t, expires: Date.now() + TTL * 1000 });
-              return { buf: b, type: t, source: 'WAIT-READY', metaUploadedAt: readyMeta.uploadedAt };
-            }
-          }
-          // else fallthrough to try to get lock and become leader
-        }
+      hits = await redis.incr(hitsKey);
+      // set an expiry on hitsKey if newly created
+      if (hits === 1) {
+        await redis.expire(hitsKey, META_TTL).catch(()=>{});
       }
     } catch (e) {
-      // ignore
+      console.warn('redis.incr(hitsKey) error:', e && e.message ? e.message : e);
+      // if redis fails, fallback: behave like hits==1 (do not upload)
+      hits = 1;
     }
 
-    // 5) attempt to acquire lock atomically
-    let locked = null;
+    // store hits header later
+    let uploadTriggered = false;
+
+    // 5) FIRST HIT behavior (hits === 1) -> fetch origin, write /tmp, set meta 'seen' and return, DO NOT upload
+    if (hits === 1) {
+      // mark meta seen (so others know at least one hit happened)
+      try {
+        await redis.set(metaKey, JSON.stringify({ status: 'seen', seenAt: Date.now() }), { EX: META_TTL });
+      } catch (e){ console.warn('meta seen set failed:', e && e.message ? e.message : e); }
+
+      // fetch origin and return content (no upload)
+      const t0 = Date.now();
+      const originResp = await fetch(dest, { headers: { 'User-Agent': 'VercelProxy/FirstHit' } });
+      const tOrigin = Date.now() - t0;
+      if (!originResp.ok) throw new Error(`Origin fetch failed: ${originResp.status}`);
+      const buf = Buffer.from(await originResp.arrayBuffer());
+      const type = originResp.headers.get('content-type') || 'application/octet-stream';
+
+      // write /tmp and memCache best-effort
+      await writeTmpSafe(tmpPath, buf).catch(()=>{});
+      memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
+
+      return { buf, type, source: 'ORIGIN-FIRST', tOrigin, uploadTriggered: false };
+    }
+
+    // 6) SECOND HIT or more (hits >= 2): ensure we trigger upload exactly once
+    // Try to acquire upload lock. If we get it, we mark meta 'uploading' and start background upload.
+    // If someone else already set meta uploading or got lock, we will wait for meta.ready.
+    let meta = null;
     try {
-      locked = await redis.set(lockKey, '1', { NX: true, EX: LOCK_SEC });
-    } catch (e) {
-      console.warn('redis.set(lockKey) error:', e && e.message ? e.message : e);
-      locked = null;
-    }
-
-    // If we didn't get lock and request is HEAD => try to wait + return headers
-    if (!locked && req.method === 'HEAD') {
-      const ready = await waitForMetaReady(redis, metaKey, 8000);
-      if (ready && ready.status === 'ready') {
-        return { buf: null, type: null, source: 'BLOB-READY', metaUploadedAt: ready.uploadedAt };
+      const raw = await redis.get(metaKey);
+      if (raw) {
+        try { meta = JSON.parse(raw); } catch {}
       }
-      // attempt to acquire lock once more (race); if still can't, return 202 warming
-      const locked2 = await redis.set(lockKey, '1', { NX: true, EX: LOCK_SEC }).catch(()=>null);
-      if (!locked2) return { buf: null, type: null, source: 'WARMING' };
-      locked = locked2;
-    }
+    } catch (e) { console.warn('redis.get(metaKey) error:', e && e.message ? e.message : e); }
 
-    // If we didn't get lock and request is GET => wait for ready; if not ready, try final lock before fallback
-    if (!locked && req.method === 'GET') {
-      const readyMeta = await waitForMetaReady(redis, metaKey, 8000);
-      if (readyMeta && readyMeta.status === 'ready') {
+    // If meta is already ready, just GET blob
+    if (meta && meta.status === 'ready') {
+      try {
         const blobResp = await fetch(blobUrl, { cache: 'force-cache' });
         if (blobResp.ok) {
           const b = Buffer.from(await blobResp.arrayBuffer());
           const t = blobResp.headers.get('content-type') || 'application/octet-stream';
           await writeTmpSafe(tmpPath, b);
           memCache.set(dest, { buf: b, type: t, expires: Date.now() + TTL * 1000 });
-          return { buf: b, type: t, source: 'WAIT-LOCK', metaUploadedAt: readyMeta.uploadedAt };
+          return { buf: b, type: t, source: 'BLOB-READY', metaUploadedAt: meta.uploadedAt, uploadTriggered: false };
+        }
+      } catch (e) { console.warn('blob GET after ready failed:', e && e.message ? e.message : e); }
+    }
+
+    // If meta.status === 'uploading', don't re-trigger upload. WAIT for ready (short)
+    if (meta && meta.status === 'uploading') {
+      // Wait for ready up to a short time, then GET blob
+      const waitedMeta = await waitForMetaReady(redis, metaKey, 8000);
+      if (waitedMeta && waitedMeta.status === 'ready') {
+        const blobResp = await fetch(blobUrl, { cache: 'force-cache' });
+        if (blobResp.ok) {
+          const b = Buffer.from(await blobResp.arrayBuffer());
+          const t = blobResp.headers.get('content-type') || 'application/octet-stream';
+          await writeTmpSafe(tmpPath, b);
+          memCache.set(dest, { buf: b, type: t, expires: Date.now() + TTL * 1000 });
+          return { buf: b, type: t, source: 'BLOB-WAITED', metaUploadedAt: waitedMeta.uploadedAt, uploadTriggered: false };
         }
       }
-      // final attempt to acquire lock
-      const locked2 = await redis.set(lockKey, '1', { NX: true, EX: LOCK_SEC }).catch(()=>null);
-      if (!locked2) {
-        // fallback origin; but mark meta.uploading to reduce others
-        try { await redis.set(metaKey, JSON.stringify({ status: 'uploading', startedAt: Date.now() }), { EX: META_TTL }); } catch {}
-        const originResp = await fetch(dest, { headers: { 'User-Agent': 'VercelProxyFallback/1.0' } });
-        if (!originResp.ok) throw new Error(`Origin failed: ${originResp.status}`);
-        const fallbackBuf = Buffer.from(await originResp.arrayBuffer());
-        const fallbackType = originResp.headers.get('content-type') || 'application/octet-stream';
-        await writeTmpSafe(tmpPath, fallbackBuf);
-        const up = await tryPutBlobWithRetries(key, fallbackBuf, fallbackType, 2);
-        if (up.success) {
-          try { await redis.set(metaKey, JSON.stringify({ status: 'ready', uploadedAt: Date.now() }), { EX: META_TTL }); } catch {}
-        } else {
-          try { await redis.set(metaKey, JSON.stringify({ status: 'failed', attemptedAt: Date.now(), error: up.error }), { EX: 60 }); } catch {}
+      // if not ready, fallback to origin (rare) — but we try to avoid origin storms by not uploading here
+    }
+
+    // Try to acquire lock to become uploader
+    let lockGot = null;
+    try {
+      lockGot = await redis.set(lockKey, '1', { NX: true, EX: LOCK_SEC }); // OK or null
+    } catch (e) {
+      console.warn('redis.set(lockKey) error:', e && e.message ? e.message : e);
+      lockGot = null;
+    }
+
+    // Fetch origin anyway (uploader or not) so we can respond quickly to this request
+    const t0 = Date.now();
+    const originResp = await fetch(dest, { headers: { 'User-Agent': 'VercelProxy/SecondHit' } });
+    const tOrigin = Date.now() - t0;
+    if (!originResp.ok) throw new Error(`Origin fetch failed: ${originResp.status}`);
+    const buf = Buffer.from(await originResp.arrayBuffer());
+    const type = originResp.headers.get('content-type') || 'application/octet-stream';
+
+    // write /tmp and mem cache
+    await writeTmpSafe(tmpPath, buf).catch(()=>{});
+    memCache.set(dest, { buf, type, expires: Date.now() + TTL * 1000 });
+
+    // If we got lock, we are uploader: mark meta uploading and start async upload (only one uploader)
+    if (lockGot) {
+      uploadTriggered = true;
+      try {
+        await redis.set(metaKey, JSON.stringify({ status: 'uploading', startedAt: Date.now() }), { EX: META_TTL });
+      } catch (e) { console.warn('set meta uploading failed:', e && e.message ? e.message : e); }
+
+      // Async upload task — do not block response
+      (async () => {
+        try {
+          const up = await tryPutBlobWithRetries(key, buf, type, 3);
+          if (up.success) {
+            await redis.set(metaKey, JSON.stringify({ status: 'ready', uploadedAt: Date.now() }), { EX: META_TTL }).catch(()=>{});
+            // optionally clear hits counter (or keep it)
+            // await redis.del(hitsKey).catch(()=>{});
+          } else {
+            await redis.set(metaKey, JSON.stringify({ status: 'failed', attemptedAt: Date.now(), error: up.error }), { EX: 60 }).catch(()=>{});
+          }
+        } catch (e) {
+          try { await redis.set(metaKey, JSON.stringify({ status: 'failed', attemptedAt: Date.now(), error: (e && e.message) || String(e) }), { EX: 60 }); } catch (_){}
+          console.warn('async upload task error:', e && e.message ? e.message : e);
+        } finally {
+          // release lock
           await redis.del(lockKey).catch(()=>{});
         }
-        memCache.set(dest, { buf: fallbackBuf, type: fallbackType, expires: Date.now() + TTL * 1000 });
-        return { buf: fallbackBuf, type: fallbackType, source: 'FALLBACK-ORIGIN' };
-      }
-      locked = locked2;
-    }
-
-    // If we reach here we are leader (locked truthy)
-    // Immediately mark meta uploading so other regions won't call origin
-    try {
-      await redis.set(metaKey, JSON.stringify({ status: 'uploading', startedAt: Date.now() }), { EX: META_TTL });
-    } catch (e) {
-      console.warn('meta set uploading failed:', e && e.message ? e.message : e);
-    }
-
-    // Leader fetches origin
-    const t0 = Date.now();
-    const originResp = await fetch(dest, {
-      headers: { 'User-Agent': 'VercelBlobProxy/Leader', Connection: 'keep-alive', 'Accept-Encoding': 'identity' },
-    });
-    const tOrigin = Date.now() - t0;
-    if (!originResp.ok) {
-      await redis.del(lockKey).catch(()=>{});
-      await redis.del(metaKey).catch(()=>{});
-      throw new Error(`Origin fetch failed: ${originResp.status}`);
-    }
-    const originBuf = Buffer.from(await originResp.arrayBuffer());
-    const originType = originResp.headers.get('content-type') || 'application/octet-stream';
-
-    // best-effort write /tmp
-    await writeTmpSafe(tmpPath, originBuf).catch(()=>{});
-
-    // **CRITICAL**: upload to blob and await it — only mark meta ready after success
-    const up = await tryPutBlobWithRetries(key, originBuf, originType, 3);
-    if (up.success) {
-      try {
-        await redis.set(metaKey, JSON.stringify({ status: 'ready', uploadedAt: Date.now() }), { EX: META_TTL });
-      } catch (e) { console.warn('meta set ready failed:', e && e.message ? e.message : e); }
+      })();
     } else {
-      // upload failed — set failed meta and release lock
-      try {
-        await redis.set(metaKey, JSON.stringify({ status: 'failed', attemptedAt: Date.now(), error: up.error }), { EX: 60 });
-      } catch (e) {}
-      await redis.del(lockKey).catch(()=>{});
-      // return origin to caller but mark upload failure in header
-      memCache.set(dest, { buf: originBuf, type: originType, expires: Date.now() + TTL * 1000 });
-      return { buf: originBuf, type: originType, source: 'ORIGIN-NOUPLOAD', tOrigin, metaUploadedAt: null, uploadStatus: 'failed', uploadError: up.error };
+      // we did not get lock — another instance will upload. mark uploadTriggered false.
+      uploadTriggered = false;
     }
 
-    // success: release lock
-    await redis.del(lockKey).catch(()=>{});
-
-    memCache.set(dest, { buf: originBuf, type: originType, expires: Date.now() + TTL * 1000 });
-    return { buf: originBuf, type: originType, source: 'ORIGIN-UPLOADED', tOrigin, metaUploadedAt: Date.now(), uploadStatus: 'success' };
+    // return origin response immediately
+    return { buf, type, source: 'ORIGIN-SECOND', tOrigin, uploadTriggered };
   })();
 
   inflight.set(dest, promise);
-
   try {
     const out = await promise;
     inflight.delete(dest);
 
-    // Add diagnostic headers
+    // diagnostic headers
     if (out.tOrigin) res.setHeader('X-Timing-Origin-ms', String(out.tOrigin));
-    if (out.metaUploadedAt) res.setHeader('X-Blob-Age', String(Math.round((Date.now() - out.metaUploadedAt) / 1000)));
+    if (out.metaUploadedAt) res.setHeader('X-Blob-Age', String(Math.round((Date.now() - out.metaUploadedAt)/1000)));
     res.setHeader('X-Cache-Source', out.source || 'UNKNOWN');
+    res.setHeader('X-Upload-Triggered', String(out.uploadTriggered || false));
     if (out.uploadStatus) res.setHeader('X-Blob-Upload-Status', out.uploadStatus);
-    if (out.uploadError) res.setHeader('X-Blob-Upload-Error', String(out.uploadError).slice(0, 200));
+    if (out.uploadError) res.setHeader('X-Blob-Upload-Error', String(out.uploadError || '').slice(0,200));
     if (out.type) res.setHeader('Content-Type', out.type);
+    // Also include current hits count (best-effort): read hitsKey
+    try {
+      const redis = await getRedis();
+      const h = await redis.get(`hits:${crypto.createHash('sha1').update(dest).digest('hex')}`);
+      if (h) res.setHeader('X-Hits', h);
+    } catch (_) {}
+
     res.setHeader('Cache-Control', `public, s-maxage=${TTL}, max-age=${TTL}`);
 
     // HEAD must not return body
     if (req.method === 'HEAD') return res.status(200).end();
 
-    // Return body for GET
+    // GET returns body
     if (out.buf) return res.status(200).send(out.buf);
 
-    // Warming responses etc.
-    if (out.source === 'WARMING') return res.status(202).send('Warming');
     return res.status(504).send('Timeout/warming');
   } catch (err) {
     inflight.delete(dest);
-    console.error('[Proxy error]', err && err.message ? err.message : err);
+    console.error('[proxy error]', err && err.message ? err.message : err);
     return res.status(502).send('Error processing request.');
   }
 }
